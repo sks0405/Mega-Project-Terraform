@@ -4,19 +4,17 @@ provider "aws" {
 
 resource "aws_vpc" "devopsshack_vpc" {
   cidr_block = "10.0.0.0/16"
-
   tags = {
     Name = "devopsshack-vpc"
   }
 }
 
 resource "aws_subnet" "devopsshack_subnet" {
-  count = 2
+  count                   = 2
   vpc_id                  = aws_vpc.devopsshack_vpc.id
   cidr_block              = cidrsubnet(aws_vpc.devopsshack_vpc.cidr_block, 8, count.index)
   availability_zone       = element(["ap-south-1a", "ap-south-1b"], count.index)
   map_public_ip_on_launch = true
-
   tags = {
     Name = "devopsshack-subnet-${count.index}"
   }
@@ -24,7 +22,6 @@ resource "aws_subnet" "devopsshack_subnet" {
 
 resource "aws_internet_gateway" "devopsshack_igw" {
   vpc_id = aws_vpc.devopsshack_vpc.id
-
   tags = {
     Name = "devopsshack-igw"
   }
@@ -32,12 +29,10 @@ resource "aws_internet_gateway" "devopsshack_igw" {
 
 resource "aws_route_table" "devopsshack_route_table" {
   vpc_id = aws_vpc.devopsshack_vpc.id
-
   route {
     cidr_block = "0.0.0.0/0"
     gateway_id = aws_internet_gateway.devopsshack_igw.id
   }
-
   tags = {
     Name = "devopsshack-route-table"
   }
@@ -51,14 +46,12 @@ resource "aws_route_table_association" "devopsshack_association" {
 
 resource "aws_security_group" "devopsshack_cluster_sg" {
   vpc_id = aws_vpc.devopsshack_vpc.id
-
   egress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
-
   tags = {
     Name = "devopsshack-cluster-sg"
   }
@@ -66,21 +59,18 @@ resource "aws_security_group" "devopsshack_cluster_sg" {
 
 resource "aws_security_group" "devopsshack_node_sg" {
   vpc_id = aws_vpc.devopsshack_vpc.id
-
   ingress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
-
   egress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
-
   tags = {
     Name = "devopsshack-node-sg"
   }
@@ -89,22 +79,72 @@ resource "aws_security_group" "devopsshack_node_sg" {
 resource "aws_eks_cluster" "devopsshack" {
   name     = "devopsshack-cluster"
   role_arn = aws_iam_role.devopsshack_cluster_role.arn
-
   vpc_config {
     subnet_ids         = aws_subnet.devopsshack_subnet[*].id
     security_group_ids = [aws_security_group.devopsshack_cluster_sg.id]
   }
 }
 
-
-resource "aws_eks_addon" "ebs_csi_driver" {
-  cluster_name    = aws_eks_cluster.devopsshack.name
-  addon_name      = "aws-ebs-csi-driver"
-  
-  resolve_conflicts_on_create = "OVERWRITE"
-  resolve_conflicts_on_update = "OVERWRITE"
+# ============================================================
+# ADD 1: OIDC Provider for the EKS cluster
+# ============================================================
+data "tls_certificate" "eks" {
+  url = aws_eks_cluster.devopsshack.identity[0].oidc[0].issuer
 }
 
+resource "aws_iam_openid_connect_provider" "eks" {
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = [data.tls_certificate.eks.certificates[0].sha1_fingerprint]
+  url             = aws_eks_cluster.devopsshack.identity[0].oidc[0].issuer
+}
+
+# ============================================================
+# ADD 2: IAM Role for EBS CSI Driver (IRSA)
+# ============================================================
+data "aws_iam_policy_document" "ebs_csi_assume_role" {
+  statement {
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+    effect  = "Allow"
+
+    principals {
+      type        = "Federated"
+      identifiers = [aws_iam_openid_connect_provider.eks.arn]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "${replace(aws_iam_openid_connect_provider.eks.url, "https://", "")}:sub"
+      values   = ["system:serviceaccount:kube-system:ebs-csi-controller-sa"]
+    }
+  }
+}
+
+resource "aws_iam_role" "ebs_csi_driver" {
+  name               = "AmazonEKS_EBS_CSI_DriverRole"
+  assume_role_policy = data.aws_iam_policy_document.ebs_csi_assume_role.json
+}
+
+resource "aws_iam_role_policy_attachment" "ebs_csi_driver" {
+  role       = aws_iam_role.ebs_csi_driver.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
+}
+
+# ============================================================
+# UPDATED: EBS CSI addon — now with service_account_role_arn
+# ============================================================
+resource "aws_eks_addon" "ebs_csi_driver" {
+  cluster_name             = aws_eks_cluster.devopsshack.name
+  addon_name               = "aws-ebs-csi-driver"
+  service_account_role_arn = aws_iam_role.ebs_csi_driver.arn   # 👈 KEY FIX
+
+  resolve_conflicts_on_create = "OVERWRITE"
+  resolve_conflicts_on_update = "OVERWRITE"
+
+  depends_on = [
+    aws_iam_role_policy_attachment.ebs_csi_driver,
+    aws_eks_node_group.devopsshack   # 👈 wait for nodes to be ready first
+  ]
+}
 
 resource "aws_eks_node_group" "devopsshack" {
   cluster_name    = aws_eks_cluster.devopsshack.name
@@ -121,23 +161,20 @@ resource "aws_eks_node_group" "devopsshack" {
   instance_types = ["t2.medium"]
 
   remote_access {
-    ec2_ssh_key = var.ssh_key_name
+    ec2_ssh_key               = var.ssh_key_name
     source_security_group_ids = [aws_security_group.devopsshack_node_sg.id]
   }
 }
 
 resource "aws_iam_role" "devopsshack_cluster_role" {
   name = "devopsshack-cluster-role"
-
   assume_role_policy = <<EOF
 {
   "Version": "2012-10-17",
   "Statement": [
     {
       "Effect": "Allow",
-      "Principal": {
-        "Service": "eks.amazonaws.com"
-      },
+      "Principal": { "Service": "eks.amazonaws.com" },
       "Action": "sts:AssumeRole"
     }
   ]
@@ -152,16 +189,13 @@ resource "aws_iam_role_policy_attachment" "devopsshack_cluster_role_policy" {
 
 resource "aws_iam_role" "devopsshack_node_group_role" {
   name = "devopsshack-node-group-role"
-
   assume_role_policy = <<EOF
 {
   "Version": "2012-10-17",
   "Statement": [
     {
       "Effect": "Allow",
-      "Principal": {
-        "Service": "ec2.amazonaws.com"
-      },
+      "Principal": { "Service": "ec2.amazonaws.com" },
       "Action": "sts:AssumeRole"
     }
   ]
